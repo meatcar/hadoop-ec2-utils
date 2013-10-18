@@ -1,5 +1,23 @@
 # TODO:
 # - Does AWS automagically remove dead instances?
+# - no, it doesn't. remove (ie terminate it) whence done.
+
+# When a node goes down: 
+# 1. get the EBS id of the instance that is down.
+# 2. start a new instance and attach the EBS from part 1.
+# 3. Update the conf files in the master and update the host file in the master
+#    with the ip of the slave and also remove the old slave which went down.
+# 4. start data node process on the instance created in step 2.
+# 5. update the data structure.
+ 
+# Load the state of the data structure after connecting to EC2.
+# 1. connect to EC2 and read all the instances.
+# 2. for each instances, get the attached EBS (ie. the larger of the two EBS's)
+# 3. operate under the assumption that
+#    i. there are no dead nodes.
+#    ii. all instances are part of the cluster.
+# 4. Read the master from the configuration.
+
 
 #------------------------------------------------------------------------------#
 # Script for launch amazon EC2 instances and moving EBS devices around.        #
@@ -11,6 +29,10 @@
 import boto
 from time import sleep
 import json
+import os
+from sys import exit
+
+from checkHeartbeat import run_once, LOOP_INTERVAL, DEAD_NODE_LIST
 
 # State of the vm on ec2
 ALIVE = True
@@ -31,57 +53,83 @@ class instance_decorator:
     network block devices
     '''
     def __init__(self):
-        # { instance_id: (ebs_id, state) }
-        self.instance_map = {}    
-        # INIT BASED OFF OF THE CONNECTION 
-        # LOAD ALL EXISTING INSTANCES AND VOLUMES INTO DATASTRUCTURE		
-    
+        # new plan:
+        # Maintain four data structures within this object
+        # 1 dictionary to keep track of instance_ids->ebs_id's
+        # 1 list to keep track of all the alive instances.
+        # 1 list to keep track of all the dead instances.
+        # 1 dictionary to keep track of instance ip addresses to instance id's.
+        
+        # We assume that the EBS state is always fine.
+
+        self.inst_to_ebs = dict()
+        self.alive_instance_list = list()
+        self.dead_instance_list = DEAD_NODE_LIST # need to detach the EBS from these.
+        self.ip_to_inst = dict() 
+
+        # add code to re construct the state of the data structure.
+
     '''
     Add a new instance to the datastructure 
     @return true on success
     '''
     def add_instance_entry(self, instance_id, ebs_id=None, state=ALIVE):
-        return
-    
+        # we always assume that when an instance is ALIVE when it is added to                                      
+        # the data structure.
+        self.instance_map[instance_id] = ebs_id
+        self.ip_to_inst[get_instance_ip_address(instance_id)] = instance_id
+        self.alive_instance_list.add(instance_id)
+
     ''' 
     Remove the given instance from the datastructure
     @return the associated state and block device id
     '''
     def remove_instance_entry(self, instance_id):
-        return 
+        self.inst_to_ebs.pop(instance_id)
+        self.alive_instance_list.remove(instance_id)
+        instance_ip = [i for key, value in self.ip_to_inst.items() if value == instance_id][0]
+        self.ip_to_inst.pop(instance_ip)
+
+    '''
+    Return the instance id associated for the given ip address.
+    '''
+    def get_instance_id(instance_ip):
+        return self.ip_to_inst[instance_ip]
 
     '''
     Retrive the block device id for a given instance
     @return the block device id
     '''
     def get_ebs_id(self, instance_id):
-        return
+        return self.inst_to_ebs[instance_id]
+
     '''
     Retrive the state for a given instance
     @return state
     '''
-    def get_state(self, instance_id):
-        return
+    def is_dead(self, instance_id):
+        return instance_id in self.dead_instance_list
+
     '''
     Return a list of instances with state=DEAD
     @return dead instances
     '''
     def get_dead_instances(self):
-        return 
+        return self.dead_instance_list
     
     '''
-    Return all instances
-    @return all instances
+    Return all alive instances
+    @return all alive instances
     '''
-    def get_all_instances(self):
-        return
+    def get_alive_instances(self):
+        return self.alive_instance_list
 
     '''
     Update the entry in the datastructure
-    @return true on success
     '''
-    def update_instance_entry(self, instance_id):
-        return
+    def update_instance_entry(self, instance_id, ebs_id):
+        self.inst_to_ebs[instance_id] = ebs_id
+
 '''
 Connect to the AWS
 @return true on success
@@ -90,7 +138,7 @@ def connect_to_EC2(key=KEY, secret_key=SECRET_KEY):
     global conn
     conn = boto.connect_ec2(
         aws_access_key_id = key,
-	    aws_secret_access_key= secret_key)
+            aws_secret_access_key= secret_key)
 
     return 
 
@@ -198,8 +246,70 @@ def detach_EBS(ebs_id, instance_id, device="/dev/sdz"):
         sleep(FREEZE)
 
     return True
+
+
+'''
+Utility functions
+'''
+
+'''
+Returns the IP address associated with the given instance_id.
+Note to self: This IP address will identify which nodes have failed in the log.
+
+@instance_id
+'''
+def get_instance_ip_address(instance_id):
+    instance = get_instance(instance_id)
+    return instance.ip_address
+
 if __name__ == "__main__":
-    print "hi"
+    print "STARTING EC2 AUTOMATION"
+    connect_to_EC2()
+
+    prime = instance_decorator();
+    # prime.initialize() <--
+
+    # fork and start the process for detecting dead nodes.
+    pid = os.fork()
+    r,w = os.pipe()
+
+
+    if pid > 0:
+        print "CHILD PROCESS RUNNING THE HEART BEAT CHECKER"
+        #we need to clean up properly later i.e send a kill signal to child proccess
+
+        os.close()
+        w = os.fdopen(w, 'w')
+        while True:
+            # pass out put from this method into our open pipe                                                                 # write_to_pipe(run_once())                                                                            
+            dead_ips = run_once()
+            [ w.write(ip) for ip in dead_ips]
+            time.sleep(LOOP_INTERVAL)
+        w.close();
+        exit(1)
+    # while dead node list is not changed. wait
+    # else if dead node list changes, handle it
+    # return to waiting
+    
+    # needs to be in a loop
+    os.close(w)
+    r = os.fdopen(r)
+    dead_ip = r.read()
+    dead_instance_id = prime.get_instance_id(dead_ip)
+    free_ebs_id = prime.get_ebs_id(dead_instance_id)
+    
+    new_instance_id = launch_instance()
+    attach_EBS(free_ebs_id, new_instance_id)
+    
+    # ssh into the new instance and mount the ebs
+    # need to update the conf files for the master
+
+    prime.add_instance_entry(new_instance_id, free_ebs_id);
+    prime.remove_instance_entry(dead_instance_id):
+    
+    # ssh into the new instance and start the datanode process.
+    
+    # handle user input asking to add instances to our cluster.
     #connect_to_EC2()
     #instance_id = launch_instance()
     #print instance_id
