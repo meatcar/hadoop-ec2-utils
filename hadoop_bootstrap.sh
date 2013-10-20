@@ -4,8 +4,6 @@ PASS="hduser"
 GROUP="hadoop"
 PEM="/home/hduser/hadoopKey.pem"
 HADOOP_LOCATION="ubuntu@ec2-23-20-76-61.compute-1.amazonaws.com"
-
-
 echo "BOOTSTRAPPING HADOOP: PHASE JAVA";
 apt-get -y update;
 echo "UPDATED HADOOP: INSTALLING JAVA";
@@ -19,7 +17,6 @@ adduser --ingroup hadoop hduser --quiet;
 echo "USER ADDED: SETTING UP THE ENVIORNMENT FOR THE USER";
 echo "export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64" >> /home/$USER/.bashrc
 COMMAND=su -l $USER -c 'echo "GENERATING KEYPAIR FOR USER";ssh-keygen -t rsa -P "" -f /home/$USER/.ssh/id_rsa;cat .ssh/id_rsa.pub >> .ssh/authorized_keys;exit;'
-
 # You would not believe the effort it takes to create a multiline string 
 # that contains \n and - while being formatted identically to a pub key file.
 echo "CREATING THE HADOOP KEY"; 
@@ -33,10 +30,7 @@ printf "END RSA PRIVATE KEY" >> $PEM
 echo -n -----  >> $PEM 
 chmod 700 $PEM; 
 chown $USER:$GROUP $PEM
-
 echo "COPYING OVER HADOOP";
 scp -i $PEM $HADOOP_LOCATION:/home/hduser/hadoop.tar.gz /home/hduser/;
 chown $USER:$GROUP /home/hduser/hadoop.tar.gz;
-
 su -l $USER -c 'tar -xvf hadoop.tar.gz;'
-

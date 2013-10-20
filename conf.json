@@ -1,0 +1,7 @@
+{ 
+  "ami" : "ami-9bb3e6f2", 
+  "key" : "AKIAIQRY4VQJ2SXJSS5A", 
+  "secret_key" : "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", 
+  "region" : "us-east-1d",
+  "master-ip": "10.156.150.60" 
+}

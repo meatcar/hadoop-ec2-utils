@@ -1,3 +1,4 @@
+#!/usr/bin/python
 # TODO:
 # - Does AWS automagically remove dead instances?
 # - no, it doesn't. remove (ie terminate it) whence done.
@@ -24,13 +25,14 @@
 # author: Abdi Dahir, Karan Dhiman                                             #
 # date: August 12th, 2013                                                      #
 #                                                                              #
-# ami-7d1d977c                                                                 #
 #------------------------------------------------------------------------------#
 import boto
 from time import sleep
 import json
 import os
 from sys import exit
+import subprocess
+import threading
 
 from checkHeartbeat import run_once, LOOP_INTERVAL, DEAD_NODE_LIST
 
@@ -39,14 +41,19 @@ ALIVE = True
 DEAD = False
 
 # Load in the ec2 properties located in the specified conf file
-PROPERTIES = json.loads(open("conf.json").read())
+with open("conf.json") as conf:
+    PROPERTIES = json.loads(conf.read())
 AMI = PROPERTIES["ami"]
 SECRET_KEY = PROPERTIES["secret_key"]
 KEY = PROPERTIES["key"]
-conn = None
-#REGION = PROPERTIES["region"]
 
+#REGION = PROPERTIES["region"]
+with open("/home/hduser/.ssh/id_rsa.pub", "r") as sshkey:
+    SSH_KEY = sshkey.read()
+LOCK = threading.Lock()
+conn = None
 FREEZE=10
+
 class instance_decorator:
     '''
     Datastructure for maintaining instances, their states and their respective 
@@ -76,59 +83,68 @@ class instance_decorator:
     def add_instance_entry(self, instance_id, ebs_id=None, state=ALIVE):
         # we always assume that when an instance is ALIVE when it is added to                                      
         # the data structure.
-        self.instance_map[instance_id] = ebs_id
-        self.ip_to_inst[get_instance_ip_address(instance_id)] = instance_id
-        self.alive_instance_list.add(instance_id)
+		
+        with LOCK:
+            self.instance_map[instance_id] = ebs_id
+            self.ip_to_inst[get_instance_private_ip(instance_id)] = instance_id
+            self.alive_instance_list.add(instance_id)
 
     ''' 
     Remove the given instance from the datastructure
     @return the associated state and block device id
     '''
     def remove_instance_entry(self, instance_id):
-        self.inst_to_ebs.pop(instance_id)
-        self.alive_instance_list.remove(instance_id)
-        instance_ip = [i for key, value in self.ip_to_inst.items() if value == instance_id][0]
-        self.ip_to_inst.pop(instance_ip)
+        with LOCK:
+            self.inst_to_ebs.pop(instance_id)
+            self.alive_instance_list.remove(instance_id)
+            instance_ip = [i for key, value in self.ip_to_inst.items() if value == instance_id][0]
+            self.ip_to_inst.pop(instance_ip)
 
     '''
     Return the instance id associated for the given ip address.
     '''
     def get_instance_id(instance_ip):
-        return self.ip_to_inst[instance_ip]
+        with LOCK:
+            return self.ip_to_inst[instance_ip]
 
     '''
     Retrive the block device id for a given instance
-    @return the block device id
+    @return the block device idsudo id -nu
     '''
     def get_ebs_id(self, instance_id):
-        return self.inst_to_ebs[instance_id]
+        with LOCK:
+            return self.inst_to_ebs[instance_id]
 
     '''
     Retrive the state for a given instance
     @return state
     '''
     def is_dead(self, instance_id):
-        return instance_id in self.dead_instance_list
+        with LOCK:
+            return instance_id in self.dead_instance_list
 
     '''
     Return a list of instances with state=DEAD
     @return dead instances
     '''
     def get_dead_instances(self):
-        return self.dead_instance_list
+        with LOCK:
+            return self.dead_instance_list
     
     '''
     Return all alive instances
     @return all alive instances
     '''
     def get_alive_instances(self):
-        return self.alive_instance_list
+        with LOCK:
+            return self.alive_instance_list
 
     '''
     Update the entry in the datastructure
     '''
     def update_instance_entry(self, instance_id, ebs_id):
-        self.inst_to_ebs[instance_id] = ebs_id
+        with LOCK:
+            self.inst_to_ebs[instance_id] = ebs_id
 
 '''
 Connect to the AWS
@@ -146,21 +162,50 @@ def connect_to_EC2(key=KEY, secret_key=SECRET_KEY):
 @return the instance object for the given instance id
 '''
 def get_instance(instance_id):
-    return conn.get_all_instances(instance_ids=instance_id)[0].instances[0]
+    return conn.get_only_instances(instance_ids=instance_id)[0]
+
+
+'''
+@return the instance object for the given instance id
+'''
+def get_all_instances(filt={"tag-key":"prime"}):
+    return conn.get_only_instances(filters=filt)
+
+
+'''
+Returns the PRIVATE IP address associated with the given instance_id.
+Note to self: This IP address will identify which nodes have failed in the log.
+
+@instance_id
+'''
+def get_instance_private_ip(instance_id):
+    instance = get_instance(instance_id)
+    return instance.private_ip_address
+
+'''
+Returns the IP address associated with the given instance_id.
+@instance_id
+'''
+def get_instance_ip(instance_id):
+    instance = get_instance(instance_id)
+    return instance.ip_address
+
 
 '''
 launch a predefined ubuntu image with Hadoop installed.
 This is launch without an EBS attached.
 
-Root store is local.
+Root store is ebs.
 
 @return instance id on succesful launch.
 '''
 def launch_instance(ami=AMI):
     image = conn.get_image(ami)
-    reserv = image.run()
+    reserv = image.run(security_groups=["HadoopSecurityGroup"], instance_type="m1.small", key_name="hadoopKey")
     instance = reserv.instances[0]
+    instance.add_tag("prime")
 
+    print "launching instance ..."
     while(instance.update() != "running"):
         if instance.state != "pending":
             # Instance is not pending => instance won't start
@@ -168,6 +213,7 @@ def launch_instance(ami=AMI):
         sleep(FREEZE)
 
     return instance.id
+
 
 '''
 Delete a given instance.
@@ -177,6 +223,7 @@ def delete_instance(instance_id):
     instance = get_instance(instance_id)
     instance.terminate()
 
+    print "deleting instance ..."
     while(instance.update() != "terminated"):
         if instance.state != "shutting-down":
             # Instance is not shutting down => instance won't shutdown
@@ -247,49 +294,40 @@ def detach_EBS(ebs_id, instance_id, device="/dev/sdz"):
 
     return True
 
-
-'''
-Utility functions
-'''
-
-'''
-Returns the IP address associated with the given instance_id.
-Note to self: This IP address will identify which nodes have failed in the log.
-
-@instance_id
-'''
-def get_instance_ip_address(instance_id):
-    instance = get_instance(instance_id)
-    return instance.ip_address
-
-if __name__ == "__main__":
+def run():
     print "STARTING EC2 AUTOMATION"
     connect_to_EC2()
 
     prime = instance_decorator();
     # prime.initialize() <--
 
+    # fork and start the process for processing commands.
+    upid = os.fork()
+    if upid > 0:
+        print "CHILD PROCESS RUNNING THE USER INPUT LOOP"
+        while True:
+            exit(0)
+        # read from standard in, wait for commands ... do we need to write an api?
+        exit(1)
+
     # fork and start the process for detecting dead nodes.
-    pid = os.fork()
+    dpid = os.fork()
     r,w = os.pipe()
 
 
-    if pid > 0:
+    if dpid > 0:
         print "CHILD PROCESS RUNNING THE HEART BEAT CHECKER"
         #we need to clean up properly later i.e send a kill signal to child proccess
 
         os.close()
         w = os.fdopen(w, 'w')
         while True:
-            # pass out put from this method into our open pipe                                                                 # write_to_pipe(run_once())                                                                            
+            # write deadips to pipe
             dead_ips = run_once()
             [ w.write(ip) for ip in dead_ips]
             time.sleep(LOOP_INTERVAL)
         w.close();
         exit(1)
-    # while dead node list is not changed. wait
-    # else if dead node list changes, handle it
-    # return to waiting
     
     # needs to be in a loop
     os.close(w)
@@ -300,23 +338,21 @@ if __name__ == "__main__":
     
     new_instance_id = launch_instance()
     attach_EBS(free_ebs_id, new_instance_id)
-    
     # ssh into the new instance and mount the ebs
-    # need to update the conf files for the master
+    subprocess.call(["sh", "/home/ubuntu/modify_node.sh", get_instance_ip(new_instance_id), SSH_KEY, "xvdz"])
+    subprocess.call(shlex.split('sudo -u hduser sh -c "ls /home/hduser/.ssh"'))
 
-    prime.add_instance_entry(new_instance_id, free_ebs_id);
-    prime.remove_instance_entry(dead_instance_id):
+    
+    # need to update the conf files for the master
+    with open("/etc/hosts", "a") as HOSTS:
+        HOSTS.write("{ip} slave{ip}\n".format(ip=get_instance_private_ip(new_instance_id)))
+
+    prime.add_instance_entry(new_instance_id, free_ebs_id)
+    prime.remove_instance_entry(dead_instance_id)
     
     # ssh into the new instance and start the datanode process.
-    
-    # handle user input asking to add instances to our cluster.
-    #connect_to_EC2()
-    #instance_id = launch_instance()
-    #print instance_id
-    #instance = get_instance(instance_id)
-    #instance.update()
-    #print instance.status
-    #sleep(20)
-    #delete_instance(instance_id)
-    #instance.update()
 
+if __name__ == "__main__":
+   print "hi" 
+   connect_to_EC2()
+   prime = instance_decorator()
