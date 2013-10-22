@@ -33,6 +33,7 @@ import os
 from sys import exit
 import subprocess
 import threading
+import pipes
 
 from checkHeartbeat import run_once, LOOP_INTERVAL, DEAD_NODE_LIST
 
@@ -46,6 +47,7 @@ with open("conf.json") as conf:
 AMI = PROPERTIES["ami"]
 SECRET_KEY = PROPERTIES["secret_key"]
 KEY = PROPERTIES["key"]
+MASTER = PROPERTIES["master-ip"]
 
 #REGION = PROPERTIES["region"]
 with open("/home/hduser/.ssh/id_rsa.pub", "r") as sshkey:
@@ -75,6 +77,28 @@ class instance_decorator:
         self.ip_to_inst = dict() 
 
         # add code to re construct the state of the data structure.
+        
+        # Algorithm:
+        # Get all currently running instances with the 'prime*' tag
+        #     for each of the instances get the 
+        #     1. attached EBS (secondary).
+        #     2. private IP
+        #     3. the state - DEAD || ALIVE
+        # populate the data structure with this information.
+        
+        all_instances = get_all_instances()
+        for instance in all_instances:
+            self.ip_to_inst[get_instance_private_ip(instance.id)] = instance.id
+            self.inst_to_ebs[instance.id] = instance.block_device_mapping['/dev/sdz'].volume_id
+
+            if instance.state == 'running':
+                self.alive_instance_list.append(instance.id) 
+            else:
+                print "added a dead node"
+                #self.dead_instance_list.append(instance.id)
+    
+        for dead_instance in self.dead_instance_list:
+            reactivate_EBS(self, dead_instance.id)
 
     '''
     Add a new instance to the datastructure 
@@ -85,7 +109,7 @@ class instance_decorator:
         # the data structure.
 		
         with LOCK:
-            self.instance_map[instance_id] = ebs_id
+            self.inst_to_ebs[instance_id] = ebs_id
             self.ip_to_inst[get_instance_private_ip(instance_id)] = instance_id
             self.alive_instance_list.add(instance_id)
 
@@ -103,7 +127,7 @@ class instance_decorator:
     '''
     Return the instance id associated for the given ip address.
     '''
-    def get_instance_id(instance_ip):
+    def get_instance_id(self, instance_ip):
         with LOCK:
             return self.ip_to_inst[instance_ip]
 
@@ -145,6 +169,12 @@ class instance_decorator:
     def update_instance_entry(self, instance_id, ebs_id):
         with LOCK:
             self.inst_to_ebs[instance_id] = ebs_id
+
+    def __repr__(self):
+        return "alive instances: " + str(self.alive_instance_list) + "\n" \
+                + "dead instances: " + str(self.dead_instance_list) + "\n"\
+                + "ip_to_inst: " + str(self.ip_to_inst) + "\n"            \
+                + "inst_to_ebs: " + str(self.inst_to_ebs) + "\n"          
 
 '''
 Connect to the AWS
@@ -294,65 +324,107 @@ def detach_EBS(ebs_id, instance_id, device="/dev/sdz"):
 
     return True
 
+'''
+start a new node with the ebs of the given dead node. 
+prime contains the state of the current cluster.
+
+@return true on success
+'''
+def reactivate_EBS(prime, dead_ip): 
+    dead_instance_id = prime.get_instance_id(dead_ip)
+    free_ebs_id = prime.get_ebs_id(dead_instance_id)
+
+    print bcolors.OKGREEN+"REACTIVATE DEAD IP: "+str(dead_instance_id)+" AND EBS "+ str(free_ebs_id)+bcolors.ENDC
+    new_instance_id = launch_instance()
+    attach_EBS(free_ebs_id, new_instance_id)
+    # ssh into the new instance and mount the ebs
+    # ssh into the new instance and start the datanode process.
+    subprocess.call(["sh", "/home/ubuntu/modify_node.sh", get_instance_ip(new_instance_id), SSH_KEY, "xvdz", MASTER])
+
+    # need to update the conf files for the master
+    with open("/etc/hosts", "a") as HOSTS:
+        HOSTS.write("{ip} slave{ip}\n".format(ip=get_instance_private_ip(new_instance_id)))
+
+    # update the slave names in the slaves conf file
+    with open("/home/hduser/hadoop/hadoop-1.2.1/conf/slaves", "a") as SLAVES:
+        SLAVES.write("slave{ip}\n".format(ip=get_instance_private_ip(new_instance_id)))
+
+
+    prime.add_instance_entry(new_instance_id, free_ebs_id)
+    prime.remove_instance_entry(dead_instance_id)
+
 def run():
     print "STARTING EC2 AUTOMATION"
     connect_to_EC2()
-
+    temp = []
     prime = instance_decorator();
     # prime.initialize() <--
+    print(prime)
 
     # fork and start the process for processing commands.
     upid = os.fork()
     if upid > 0:
         print "CHILD PROCESS RUNNING THE USER INPUT LOOP"
-        while True:
-            exit(0)
+        usr_input = raw_input(bcolors.HEADER + ">> " + bcolors.ENDC)
+
+        while usr_input != "exit":
+            if usr_input == "state":
+                print prime
+            if usr_input == "temp":
+                print temp
+            usr_input = raw_input(bcolors.HEADER + ">> " + bcolors.ENDC)
+
         # read from standard in, wait for commands ... do we need to write an api?
-        exit(1)
+        exit(0)
 
     # fork and start the process for detecting dead nodes.
-    dpid = os.fork()
     r,w = os.pipe()
-
-
+    r = os.fdopen(r, "r", 0)
+    w = os.fdopen(w, "w", 0)
+    dpid = os.fork()
     if dpid > 0:
         print "CHILD PROCESS RUNNING THE HEART BEAT CHECKER"
         #we need to clean up properly later i.e send a kill signal to child proccess
-
-        os.close()
-        w = os.fdopen(w, 'w')
+        r.close()
         while True:
             # write deadips to pipe
+            print "calling run_once";
             dead_ips = run_once()
-            [ w.write(ip) for ip in dead_ips]
-            time.sleep(LOOP_INTERVAL)
+            print bcolors.OKBLUE + str(dead_ips) + bcolors.ENDC
+            for ip in dead_ips:
+                print >>w, "%s" % ip
+                w.flush()
+            sleep(LOOP_INTERVAL)
+
         w.close();
         exit(1)
     
-    # needs to be in a loop
-    os.close(w)
-    r = os.fdopen(r)
-    dead_ip = r.read()
-    dead_instance_id = prime.get_instance_id(dead_ip)
-    free_ebs_id = prime.get_ebs_id(dead_instance_id)
-    
-    new_instance_id = launch_instance()
-    attach_EBS(free_ebs_id, new_instance_id)
-    # ssh into the new instance and mount the ebs
-    subprocess.call(["sh", "/home/ubuntu/modify_node.sh", get_instance_ip(new_instance_id), SSH_KEY, "xvdz"])
-    subprocess.call(shlex.split('sudo -u hduser sh -c "ls /home/hduser/.ssh"'))
+    w.close()
+    while True:
+        dead_ip = r.readline()
+        temp.append(dead_ip)
+        if dead_ip:
+            dead_ip = dead_ip.split(":")[0]
+            reactivate_EBS(prime, dead_ip)
 
+    print "SHOULD NEVER GET HERE"
     
-    # need to update the conf files for the master
-    with open("/etc/hosts", "a") as HOSTS:
-        HOSTS.write("{ip} slave{ip}\n".format(ip=get_instance_private_ip(new_instance_id)))
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
 
-    prime.add_instance_entry(new_instance_id, free_ebs_id)
-    prime.remove_instance_entry(dead_instance_id)
-    
-    # ssh into the new instance and start the datanode process.
+    def disable(self):
+        self.HEADER = ''
+        self.OKBLUE = ''
+        self.OKGREEN = ''
+        self.WARNING = ''
+        self.FAIL = ''
+        self.ENDC = ''
 
 if __name__ == "__main__":
-   print "hi" 
-   connect_to_EC2()
-   prime = instance_decorator()
+    print bcolors.HEADER + "Hi :) "+ bcolors.ENDC
+    run()

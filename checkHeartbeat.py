@@ -7,17 +7,18 @@ import subprocess
 import datetime
 import time
 import os
+import shlex
 
 TIMEOUT = 6        # in seconds, heartbeat longer than TIMEOUT, need repair
 LOOP_INTERVAL = 6  # in seconds, sleep time of run_once()
 OUTPUT_FILE = "nodes_to_repair.txt"
-
+HADOOP_BIN = "/home/hduser/hadoop/hadoop-1.2.1/bin"
 # List to keep track 
 DEAD_NODE_LIST = set()
 
 def get_report():
 
-    return subprocess.check_output(["hadoop", "dfsadmin", "-report"])
+    return subprocess.check_output(shlex.split('sudo -u hduser sh -c '+ HADOOP_BIN +'"/hadoop dfsadmin -report"'))
 
 def parse_report(report):
     '''returns a dictionary: name (str) -> heartbeats in seconds (float)'''
@@ -69,6 +70,7 @@ def run_once():
 #            PRINT "Dead datanode (%s) detected at %s" \
 #                    % (key, str(datetime.datetime.now()))
 
+    
     return dead_ips
 
 def run():
@@ -85,6 +87,4 @@ def run():
         # write_to_pipe(run_once())
         return run_once()
         time.sleep(LOOP_INTERVAL)
-       
-if __name__ == "__main__":
-    run()
+
