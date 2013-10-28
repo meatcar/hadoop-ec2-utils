@@ -88,17 +88,24 @@ class instance_decorator:
         
         all_instances = get_all_instances()
         for instance in all_instances:
-            self.ip_to_inst[get_instance_private_ip(instance.id)] = instance.id
-            self.inst_to_ebs[instance.id] = instance.block_device_mapping['/dev/sdz'].volume_id
+            # Add node to ip->inst mapping if ip can be located for the node
+            if get_instance_private_ip(instance.id):
+                self.ip_to_inst[get_instance_private_ip(instance.id)] = instance.id
+            # Add node to inst->ebs mapping if node has an ebs in the usual location
+            if instance.block_device_mapping.has_key('/dev/sdz'):
+                self.inst_to_ebs[instance.id] = instance.block_device_mapping['/dev/sdz'].volume_id
 
+            # Add node to alive instance list if its running, otherwise its dead to me.
             if instance.state == 'running':
                 self.alive_instance_list.append(instance.id) 
             else:
                 print "added a dead node"
-                #self.dead_instance_list.append(instance.id)
+                self.dead_instance_list.add(instance.id)
     
         for dead_instance in self.dead_instance_list:
-            reactivate_EBS(self, dead_instance.id)
+            # Reactivate dead nodes iff it has an ebs (i.e was not an intentional shut down)
+            if dead_instance in self.inst_to_ebs.keys():
+                reactivate_EBS(self, dead_instance.id)
 
     '''
     Add a new instance to the datastructure 
@@ -117,17 +124,23 @@ class instance_decorator:
     Remove the given instance from the datastructure
     @return the associated state and block device id
     '''
-    def remove_instance_entry(self, instance_id):
-        with LOCK:
-            self.inst_to_ebs.pop(instance_id)
-            self.alive_instance_list.remove(instance_id)
-            instance_ip = [i for key, value in self.ip_to_inst.items() if value == instance_id][0]
-            self.ip_to_inst.pop(instance_ip)
+    def remove_instance_entry(self, instance_id, wait_lock_do_I_hold=False):
+
+        if not wait_lock_do_I_hold:
+            LOCK.aquire()
+        self.inst_to_ebs.pop(instance_id)
+        self.alive_instance_list.remove(instance_id)
+        instance_ip = [key for key, value in self.ip_to_inst.items() if value == instance_id][0]
+        self.ip_to_inst.pop(instance_ip)
+        if not wait_lock_do_I_hold:
+            LOCK.release()
 
     '''
     Return the instance id associated for the given ip address.
     '''
-    def get_instance_id(self, instance_ip):
+    def get_instance_id(self, instance_ip, wait_lock_do_I_hold=False):
+        if wait_lock_do_I_hold:
+            return self.ip_to_inst[instance_ip]
         with LOCK:
             return self.ip_to_inst[instance_ip]
 
@@ -135,9 +148,18 @@ class instance_decorator:
     Retrive the block device id for a given instance
     @return the block device idsudo id -nu
     '''
-    def get_ebs_id(self, instance_id):
+    def get_ebs_id(self, instance_id, wait_lock_do_I_hold=False):
+        if wait_lock_do_I_hold:
+            return self.inst_to_ebs[instance_id]
         with LOCK:
             return self.inst_to_ebs[instance_id]
+
+    '''
+    Return if the given instance_id is the master node
+    @return boolean
+    '''
+    def is_master(self, instance_id):
+        return MASTER == get_instance_private_ip(instance_id)  
 
     '''
     Retrive the state for a given instance
@@ -156,6 +178,37 @@ class instance_decorator:
             return self.dead_instance_list
     
     '''
+    Remove all slave nodes in the current cluster
+    @return number of nodes deleted
+    '''
+    def remove_slaves(self):
+        counter = 0
+        with LOCK:
+            for instance in self.alive_instance_list:
+                inst = get_instance(instance)
+                inst.update()
+                if not self.is_master(instance) and inst.state == "running":
+                    print "Working with instance: %s, ip: %s" %(instance, get_instance_private_ip(instance))
+                    detach_EBS(self.get_ebs_id(instance, True), instance)
+                    delete_EBS(self.get_ebs_id(instance, True))
+                    delete_instance(instance)
+                    self.remove_instance_entry(instance, True)
+                    counter+=1
+
+        return counter
+
+    '''
+    Remove instance from cluster and structure
+    '''
+    def remove_instance_and_ebs(self, instance_id):
+        with LOCK:
+            if not self.is_master(instance_id):
+                delete_EBS(self.get_ebs_id(instance_id, True))
+                delete_instance(instance_id)
+                self.remove_instance_entry(instance_id, True)
+
+
+    '''
     Return all alive instances
     @return all alive instances
     '''
@@ -170,6 +223,10 @@ class instance_decorator:
         with LOCK:
             self.inst_to_ebs[instance_id] = ebs_id
 
+
+    ''' 
+    Pretty printer for class
+    '''
     def __repr__(self):
         return "alive instances: " + str(self.alive_instance_list) + "\n" \
                 + "dead instances: " + str(self.dead_instance_list) + "\n"\
@@ -274,8 +331,8 @@ launch a EBS drive
 @return the ebs id on succesful launch
 '''
 def create_EBS(size, region="us-east-1d"):
+    print "creating EBS ..."
     vol = conn.create_volume(size, region);
-   
     while(vol.update() != "available"):
         if vol.status != "creating":
             # EBS is not being created => err?
@@ -290,6 +347,7 @@ launch a EBS drive
 @return the ebs id on succesful launch
 '''
 def delete_EBS(ebs_id):
+    print "deleting EBS ..."
     vol = conn.get_all_volumes(volume_ids=ebs_id)[0];
     vol.delete();
     return True
@@ -299,6 +357,7 @@ attach a given EBS drive to a given instance
 @return true on success
 '''
 def attach_EBS(ebs_id, instance_id, device="/dev/sdz"):
+    print "attaching EBS ..."
     conn.attach_volume(ebs_id, instance_id, device);
     vol = get_EBS(ebs_id);
     while(vol.update() != "in-use"):
@@ -314,6 +373,7 @@ detach a given EBS drive from a given instance
 @return true on success
 '''
 def detach_EBS(ebs_id, instance_id, device="/dev/sdz"):
+    print "detaching EBS ..."
     conn.detach_volume(ebs_id, instance_id, device)
     vol = get_EBS(ebs_id);
     while(vol.update() != "available"):
@@ -427,4 +487,4 @@ class bcolors:
 
 if __name__ == "__main__":
     print bcolors.HEADER + "Hi :) "+ bcolors.ENDC
-    #run()
+    # run()
