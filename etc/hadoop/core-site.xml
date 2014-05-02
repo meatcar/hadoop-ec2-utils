@@ -1,0 +1,14 @@
+<configuration>
+    <property>
+        <name>fs.default.name</name>
+        <value>hdfs://master:9000</value>
+        <description>
+        The name of the default file system. Either the literal string "local" or a host:port for NDFS.
+        </description>
+    </property>
+    <property>
+        <name>hadoop.tmp.dir</name>
+        <value>/mnt/hadoop</value>
+        <description>A base for other temporary directories.</description>
+    </property>
+</configuration>
