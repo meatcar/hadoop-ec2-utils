@@ -1,5 +1,6 @@
 {
   "ami" : "ami-d38d9aba",
+  "allspark_ami" : "ami-f051b798",
   "key" : "AKIAIQRY4VQJ2SXJSS5A",
   "secret_key" : "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",
   "region" : "us-east-1"
