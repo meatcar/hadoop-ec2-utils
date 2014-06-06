@@ -16,6 +16,8 @@ class NodeManager(object):
                 private_key=self.key + '.pem'
                 )
 
+        self.ip = self.run("dig +short %s" % self.node_name)[0].strip()
+
     def cleanup(self):
         self.ssh.close()
 
@@ -30,14 +32,13 @@ class NodeManager(object):
         self.run("chmod 0600 %s" % keyname)
 
     def setup(self):
+        self.run("echo '0.0.0.0 master' | sudo tee -a /etc/hosts")
         print "Intalling packages"
         self.run("sudo apt-get update")
         # can't disable prompts..
         #self.run("DEBIAN_FRONTEND=noninteractive sudo apt-get -y upgrade")
         self.run("sudo apt-get -y install default-jre")
         self.run("echo 'JAVA_HOME=/usr/lib/jvm/default-java' | sudo tee -a /etc/environment")
-
-        self.run("echo '0.0.0.0 master' | sudo tee -a /etc/hosts")
 
     def setup_hadoop(self):
         print "Moving config"
@@ -51,10 +52,18 @@ class NodeManager(object):
         self.run("curl http://mirror.csclub.uwaterloo.ca/apache/hadoop/common/hadoop-2.4.0/hadoop-2.4.0.tar.gz | tar -xz")
         self.run("mv hadoop-2.4.0 hadoop")
 
-    def add_cluster_config(self, slave_names, master_name):
-        self.run('sudo sed -i "s/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+ master/%s master/" /etc/hosts' % master_name)
+    def add_cluster_config(self, slave_names, master_name, master_ip):
+        # make sure to use instance's internal ip if master
+        # otherwise master can't bind to ports
+        if master_name == self.node_name:
+            master_ip = self.ip
+
+        self.run('sudo sed -i "s/[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+ master/%s master/" /etc/hosts' % master_ip)
 
         slaves = '\n'.join(slave_names)
+        slaves = map(
+                lambda x -> self.run("dig +short %s" % x)[0].strip(),
+                slaves)
         self.run("echo -n '%s\n' > hadoop/etc/hadoop/slaves" % slaves)
 
         # add each host to known_hosts for ssh purposes

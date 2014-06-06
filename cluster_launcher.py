@@ -6,7 +6,7 @@ import random
 
 from time import sleep
 
-from node_builder import NodeManager
+from node_manager import NodeManager
 
 class ClusterLauncher(object):
     group_name = u'allspark'
@@ -54,7 +54,10 @@ class ClusterLauncher(object):
 
         master_nm = NodeManager(self.key_pair_name, self.master.public_dns_name)
         master_nm.copy_key()
-        master_nm.add_cluster_config(slave_names, self.master.public_dns_name)
+        master_nm.add_cluster_config(
+                slave_names,
+                self.master.public_dns_name,
+                self.master.ip_address)
 
         self.attach_volumes_to_slaves()
 
@@ -63,12 +66,15 @@ class ClusterLauncher(object):
             self.wait_for_instance(slave)
             nm = NodeManager(self.key_pair_name, slave.public_dns_name)
             nm.copy_key()
-            master_nm.add_cluster_config(slave_names, self.master.public_dns_name)
+            nm.add_cluster_config(
+                    slave_names,
+                    self.master.public_dns_name,
+                    self.master.ip_address)
             nm.mount_volume()
 
         master_nm.start_hadoop()
 
-        self.dump_json(self.volumes, '%s-volumes.json' % self.cluser_name)
+        self.dump_json([v.id for v in self.volumes], '%s-volumes.json' % self.cluster_name)
 
 
     def create_image(self):
@@ -87,6 +93,12 @@ class ClusterLauncher(object):
                 "Hadoop Allspark Img %d" % random.randint(100, 999),
                 "Hadoop Allspark node image")
         node.terminate()
+
+        print "Waiting for ami to be available"
+        ami = self.conn.get_all_images(self.conf['allspark_ami'])[0]
+        while ami.update() != 'available':
+            sleep(1)
+
         print "Created ami %s" % self.conf['allspark_ami']
 
     def cleanup(self, delete_volumes=False):
@@ -128,6 +140,8 @@ class ClusterLauncher(object):
         group.authorize('tcp', 22, 22, '0.0.0.0/0') #ssh
         group.authorize('tcp', 8020, 8040, '0.0.0.0/0') #hadoop/yarn
         group.authorize('tcp', 9000, 9000, '0.0.0.0/0') #hadoop/hdfs
+        group.authorize('tcp', 50020, 50020, '0.0.0.0/0') #hadoop/hdfs
+        group.authorize('tcp', 50075, 50075, '0.0.0.0/0') #hadoop/hdfs
         group.authorize('icmp', -1, -1, '0.0.0.0/0') #ssh
 
         return group
@@ -138,6 +152,7 @@ class ClusterLauncher(object):
 
         if len(keys) == 1:
             return keys[0]
+        print "creating key pair"
 
         key_pair = self.conn.create_key_pair(self.key_pair_name)
         key_pair.save('./')
@@ -174,7 +189,7 @@ class ClusterLauncher(object):
         Block until instance reaches desired state.
         '''
 
-        print "waiting for %s %s" % (instance.tags['Name'], instance)
+        print "waiting for %s" % (instance)
         while(instance.update() != state):
             print "..instance is %s" % instance.state
             sleep(1)
@@ -186,7 +201,7 @@ class ClusterLauncher(object):
         if len(self.volumes) == 0:
             vol = self.conn.create_volume(
                     size=8,
-                    zone=slave.placement)
+                    zone=self.master.placement)
             self.volumes.append(vol)
 
         self.attach_vol_to_slave(self.volumes[0], self.master)
